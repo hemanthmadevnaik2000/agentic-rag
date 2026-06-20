@@ -1,0 +1,58 @@
+[project]
+name = "agentic-rag"
+version = "0.1.0"
+description = "Agentic RAG: knowledge bases + a grounded question-answering agent over websocket."
+requires-python = ">=3.11"
+dependencies = [
+    # API
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "python-multipart>=0.0.9",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "httpx>=0.27",
+    # DB / worker
+    "asyncpg>=0.29",
+    "arq>=0.26",
+    "redis>=5.0",
+    # Vector + keyword stores
+    "pymilvus>=2.4",
+    "elasticsearch>=8.13,<9",
+    # Embeddings + reranker (local)
+    "sentence-transformers>=3.0",
+    # Agent
+    "langgraph>=0.2",
+    "langchain-core>=0.3",
+    "langchain-openai>=0.2",
+    "langchain-anthropic>=0.2",
+    "langchain-experimental>=0.3",
+    "langsmith>=0.1",
+    # Loaders
+    "pypdf>=4.2",
+    "python-docx>=1.1",
+    "markdown>=3.6",
+    # Secrets
+    "cryptography>=42",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.5",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

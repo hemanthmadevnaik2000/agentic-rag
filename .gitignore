@@ -1,0 +1,29 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Environments
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+
+# Caches / models
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+models_cache/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local data
+volumes/
+data/

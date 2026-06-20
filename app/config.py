@@ -33,6 +33,10 @@ class Settings(BaseSettings):
     rrf_k: int = 60
     # Sessions / memory (checkpointer cleanup horizon, seconds)
     session_ttl_seconds: int = 86400
+    # Semantic cache (RedisVL on Redis Stack)
+    semantic_cache_enabled: bool = True
+    semantic_cache_ttl_seconds: int = 3600
+    semantic_cache_max_distance: float = 0.1
     # Tracing
     langsmith_tracing: bool = False
     langsmith_api_key: str = ""

@@ -27,6 +27,7 @@ It is a **modular monolith**: one FastAPI app with `kb` and `agent` modules, plu
 - **Grounded answers** — the LLM is forced to return structured output `{answer, references, confidence}`; a validation gate rejects low-confidence / unreferenced answers and retries with feedback before falling back to a safe "I could not find it".
 - **Source attribution** — each answer reports the **documents** (filename + version) its cited chunks came from, mapped from the retrieved set.
 - **Session memory** — multi-turn conversations persisted with a **Postgres LangGraph checkpointer**; resume a session by `session_id`, with TTL-based cleanup.
+- **Semantic cache** — a semantically similar prior query (scoped per KB set) returns a cached answer, skipping retrieval + generation; native Redis TTL via **Redis Stack / RedisVL**.
 - **Multi-provider LLMs** — OpenAI, Anthropic, and self-hosted / custom SLMs behind one `StructuredLLM` interface; providers are registered at runtime via an API.
 - **Pluggable embeddings & reranker** — local (sentence-transformers / BGE) by default, swappable for cloud.
 - **Secrets encrypted at rest** — vector-DB credentials and LLM API keys are encrypted with Fernet; the API never returns them (only a masked `secret_last4`).
@@ -141,6 +142,9 @@ All settings come from environment variables (see `.env.example`).
 | `RETRIEVAL_CANDIDATES` | `20` | Candidates fetched per retriever before fusion |
 | `RRF_K` | `60` | RRF constant |
 | `SESSION_TTL_SECONDS` | `86400` | Idle sessions purged after this many seconds (Postgres has no native TTL) |
+| `SEMANTIC_CACHE_ENABLED` | `true` | Toggle the semantic cache |
+| `SEMANTIC_CACHE_TTL_SECONDS` | `3600` | Native Redis TTL per cache entry |
+| `SEMANTIC_CACHE_MAX_DISTANCE` | `0.1` | Max cosine distance for a cache hit (~0.9 similarity); the false-hit risk knob |
 | `LANGSMITH_TRACING` | `false` | Enable LangSmith tracing |
 | `LANGSMITH_API_KEY` | _(empty)_ | LangSmith key |
 | `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` | _(empty)_ | Dev fallback only; registered LLMs live in the DB |
@@ -218,6 +222,8 @@ KBs (allowlist). The server first returns the session id:
 Then, per question, you receive status events and a final answer:
 
 ```json
+{ "type": "status", "stage": "rewriting" }
+{ "type": "status", "stage": "checking_cache" }
 { "type": "status", "stage": "retrieving" }
 { "type": "status", "stage": "reranking" }
 { "type": "status", "stage": "generating" }
@@ -225,8 +231,10 @@ Then, per question, you receive status events and a final answer:
 { "type": "answer", "answer": "...",
   "references": ["<chunk_id>"],
   "sources": [{ "filename": "handbook.pdf", "version": 1, "chunk_ids": ["<chunk_id>"] }],
-  "confidence": 0.82, "rejected": false }
+  "confidence": 0.82, "rejected": false, "cached": false }
 ```
+
+On a **semantic-cache hit**, the pipeline short-circuits after `checking_cache` and returns the answer immediately with `"cached": true`.
 
 **Keep the socket open and send more `{ "question": "..." }` messages to continue the same
 session** — the agent remembers prior turns. Reconnecting later with the same `session_id`
@@ -284,6 +292,14 @@ then returns a safe fallback. `references` are emitted as `chunk_id`s, and the r
 includes `sources` — the documents (filename + version) those cited chunks came from, mapped
 deterministically from the retrieved set.
 
+### Semantic caching
+Before retrieval, `rewrite` turns the question (+ recent history) into a standalone, canonical
+query; `cache_lookup` embeds it and searches a **RedisVL** semantic cache scoped to the KB set.
+A hit within `SEMANTIC_CACHE_MAX_DISTANCE` short-circuits straight to the answer. On a miss, an
+accepted (non-rejected) answer is written to the cache with a native Redis TTL. Re-ingesting a
+KB invalidates its cached entries (TTL is the backstop). The cache is shared across sessions and
+users for the same KB scope, since answers are KB-grounded, not user-specific.
+
 ### Sessions & memory
 Each session maps to a checkpoint `thread_id` (the conversation id). The graph is compiled
 with a Postgres `AsyncPostgresSaver`, so the accumulating `history` channel is persisted per
@@ -323,6 +339,8 @@ app/
     graph.py              LangGraph definition (+ history channel)
     runtime.py            build a runnable agent from config
     checkpointer.py       Postgres session memory + TTL cleanup
+    cache.py              semantic cache (RedisVL) + KB-scope invalidation
+    rewrite.py            history-aware standalone-query rewriting
     tools.py              query_knowledge_base (kb_ids bound server-side)
     llm/                  StructuredLLM port + provider adapters
     management.py router.py ws.py schemas.py
@@ -355,7 +373,6 @@ Full end-to-end verification (ingest -> retrieve -> answer) requires the Docker 
 
 ## Roadmap
 
-- Semantic caching (cache-lookup node at the front of the graph).
 - Hard chunk-id reference validation and/or native citations.
 - Token streaming over the WebSocket.
 - Authentication and multi-tenancy.

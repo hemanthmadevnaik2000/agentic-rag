@@ -19,3 +19,9 @@ class Answer(BaseModel):
     confidence: float = Field(
         ge=0.0, le=1.0, description="Self-assessed confidence from 0 to 1."
     )
+
+
+class RewrittenQuery(BaseModel):
+    query: str = Field(
+        description="A standalone, self-contained version of the user question."
+    )

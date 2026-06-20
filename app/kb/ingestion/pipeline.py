@@ -2,7 +2,8 @@
 
 For each file: load -> semantic chunk -> embed -> upsert to Milvus (+ optional ES).
 Re-ingesting a filename replaces its vectors in the store (latest-only); Postgres
-documents keeps a row per version as history. Blocking calls run in a thread.
+documents keeps a row per version as history. On success, the semantic cache for this
+KB is invalidated so stale answers are not served. Blocking calls run in a thread.
 """
 from __future__ import annotations
 
@@ -34,7 +35,9 @@ async def run_ingest(
             raise RuntimeError("Destination not found")
 
         token = crypto.decrypt(dest["secret_enc"]) if dest["secret_enc"] else ""
-        uri = f"http://{dest['host']}:{dest['port']}"
+        host = dest["host"]
+        port = dest["port"]
+        uri = f"http://{host}:{port}"
         provider = (kb.get("metadata") or {}).get(
             "_embedding_provider"
         ) or settings.embedding_provider
@@ -99,6 +102,13 @@ async def run_ingest(
             )
 
         await queries.set_kb_status(kb_id, "ready")
+        # Invalidate stale cached answers for this KB (TTL is the backstop).
+        try:
+            from app.agent import cache as cache_mod
+
+            await cache_mod.invalidate_kb(str(kb_id))
+        except Exception:  # noqa: BLE001
+            pass
     except Exception as exc:  # noqa: BLE001 - record failure on the KB row
         await queries.set_kb_status(kb_id, "failed", error=str(exc))
         raise

@@ -2,8 +2,8 @@
 
 Enforces the KB allowlist: requested kb_ids must be a subset of the agent
 configured kb_ids. All KBs in play must share one embedding space and destination
-(one Milvus collection), so a multi-KB query is a single filtered search. The graph
-is compiled with the Postgres checkpointer so sessions get per-thread memory.
+(one Milvus collection). The graph is compiled with the Postgres checkpointer
+(session memory) and a per-KB-set cache scope (semantic cache).
 """
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from app import crypto
+from app.agent import cache as cache_mod
 from app.agent.checkpointer import get_checkpointer
 from app.agent.graph import build_agent_graph
 from app.agent.llm.factory import build_structured_llm
@@ -70,15 +71,18 @@ async def build_runtime(
     if dest is None:
         raise RuntimeError_("Destination not found.")
     token = crypto.decrypt(dest["secret_enc"]) if dest["secret_enc"] else ""
-    uri = f"http://{dest['host']}:{dest['port']}"
+    host = dest["host"]
+    port = dest["port"]
+    uri = f"http://{host}:{port}"
 
     model, dim = next(iter(spaces))
     provider = (kbs[0].get("metadata") or {}).get(
         "_embedding_provider"
     ) or settings.embedding_provider
 
+    kb_id_strings = [str(k) for k in effective]
     target = RetrievalTarget(
-        kb_ids=tuple(str(k) for k in effective),
+        kb_ids=tuple(kb_id_strings),
         embedding_provider=provider,
         embedding_model=model,
         embedding_dim=dim,
@@ -92,6 +96,8 @@ async def build_runtime(
     except RuntimeError:
         checkpointer = None  # memory disabled if not initialized (e.g. in tests)
 
+    scope = cache_mod.make_scope(kb_id_strings)
+
     graph = build_agent_graph(
         llm,
         target,
@@ -99,5 +105,7 @@ async def build_runtime(
         max_retries=agent["max_retries"],
         system_prompt=agent["system_prompt"],
         checkpointer=checkpointer,
+        cache_scope=scope,
+        cache_kb_ids=kb_id_strings,
     )
-    return AgentRuntime(graph=graph, agent=agent, kb_ids=[str(k) for k in effective])
+    return AgentRuntime(graph=graph, agent=agent, kb_ids=kb_id_strings)

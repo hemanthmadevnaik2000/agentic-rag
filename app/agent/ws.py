@@ -1,16 +1,15 @@
-"""Websocket chat endpoint with per-session memory.
+"""Websocket chat endpoint with per-session memory and semantic caching.
 
 Protocol:
   - Client connects and sends a first message: {agent_id, kb_ids?, question?, session_id?}.
       * session_id present -> resume that session (memory restored from the checkpointer).
       * session_id absent  -> a new session is created.
   - Server replies with {"type":"session","session_id": "..."} so the client can reuse it.
-  - For each question the server streams status events
-    (retrieving / reranking / generating / validating) then one final answer.
+  - Per question, the server streams status events
+    (rewriting / checking_cache / retrieving / reranking / generating / validating)
+    then one final answer. A semantic-cache hit jumps straight to the answer with
+    "cached": true.
   - The socket stays open: send more {question} messages to continue the same session.
-
-The session id is the checkpoint thread_id (= conversation id); memory persists across
-turns and across reconnects that pass the same session_id.
 """
 from __future__ import annotations
 
@@ -24,30 +23,13 @@ from app.agent.schemas import Answer
 from app.db import queries
 
 _STATUS_BY_NODE = {
+    "rewrite": "rewriting",
+    "cache_lookup": "checking_cache",
     "retrieve": "retrieving",
     "rerank": "reranking",
     "generate": "generating",
     "validate": "validating",
 }
-
-
-def _build_sources(
-    references: list[str], retrieved: list[dict[str, Any]]
-) -> list[dict[str, Any]]:
-    """Group cited chunk_ids by their source document (filename, version)."""
-    by_id = {c.get("chunk_id"): c for c in retrieved}
-    grouped: dict[tuple[Any, Any], dict[str, Any]] = {}
-    for chunk_id in references:
-        chunk = by_id.get(chunk_id)
-        if chunk is None:
-            continue
-        key = (chunk.get("filename"), chunk.get("version"))
-        entry = grouped.setdefault(
-            key,
-            {"filename": chunk.get("filename"), "version": chunk.get("version"), "chunk_ids": []},
-        )
-        entry["chunk_ids"].append(chunk_id)
-    return list(grouped.values())
 
 
 async def _run_turn(
@@ -82,7 +64,8 @@ async def _run_turn(
         return
 
     rejected = bool(final.get("rejected", False))
-    sources = _build_sources(answer.references, final.get("retrieved", []) or [])
+    cached = bool(final.get("cached", False))
+    sources = final.get("sources", []) or []
     await ws.send_json(
         {
             "type": "answer",
@@ -91,6 +74,7 @@ async def _run_turn(
             "sources": sources,
             "confidence": answer.confidence,
             "rejected": rejected,
+            "cached": cached,
         }
     )
     await queries.add_message(
@@ -102,6 +86,7 @@ async def _run_turn(
             "sources": sources,
             "confidence": answer.confidence,
             "rejected": rejected,
+            "cached": cached,
         },
     )
     await queries.touch_conversation(session_id)
@@ -110,7 +95,6 @@ async def _run_turn(
 async def _resolve_session(
     agent_id: uuid.UUID, session_id_raw: Any
 ) -> tuple[uuid.UUID | None, str | None]:
-    """Return (session_id, error_message)."""
     if session_id_raw:
         try:
             session_id = uuid.UUID(str(session_id_raw))
@@ -156,7 +140,6 @@ async def chat_ws(ws: WebSocket) -> None:
     assert session_id is not None
     await ws.send_json({"type": "session", "session_id": str(session_id)})
 
-    # Process the first message question (if any), then loop for follow-ups.
     while True:
         question = message.get("question")
         if question:

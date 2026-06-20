@@ -9,6 +9,7 @@ from typing import Any
 from arq import cron
 from arq.connections import RedisSettings
 
+from app.agent.cache import close_cache, init_cache
 from app.agent.checkpointer import close_checkpointer, init_checkpointer
 from app.config import get_settings
 from app.db.pool import close_pool, init_pool
@@ -35,9 +36,11 @@ async def cleanup_sessions(ctx: dict[str, Any]) -> int:
 async def _startup(ctx: dict[str, Any]) -> None:
     await init_pool()
     await init_checkpointer()
+    await init_cache()
 
 
 async def _shutdown(ctx: dict[str, Any]) -> None:
+    await close_cache()
     await close_checkpointer()
     await close_pool()
 

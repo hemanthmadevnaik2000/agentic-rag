@@ -210,7 +210,10 @@ Connect to `ws://localhost:8000/ws/chat` and send:
 { "type": "status",  "stage": "reranking" }
 { "type": "status",  "stage": "generating" }
 { "type": "status",  "stage": "validating" }
-{ "type": "answer",  "answer": "...", "references": ["<chunk_id>"], "confidence": 0.82, "rejected": false }
+{ "type": "answer",  "answer": "...",
+  "references": ["<chunk_id>"],
+  "sources": [{ "filename": "handbook.pdf", "version": 1, "chunk_ids": ["<chunk_id>"] }],
+  "confidence": 0.82, "rejected": false }
 ```
 
 Minimal Python client:
@@ -251,7 +254,9 @@ candidates; they are fused with **Reciprocal Rank Fusion** and then reordered by
 `{answer, references, confidence}`. `validate` rejects answers below `confidence_threshold`
 or with no references, loops back to `generate` with corrective feedback up to `max_retries`,
 then returns a safe fallback. `references` are emitted as `chunk_id`s so a future upgrade to
-hard chunk-id validation is a small change.
+hard chunk-id validation is a small change. The WebSocket response also includes `sources` —
+the documents (filename + version) those cited chunks came from, mapped deterministically from
+the retrieved set.
 
 ### Security
 Vector-DB credentials and LLM keys are encrypted with Fernet before they touch Postgres and

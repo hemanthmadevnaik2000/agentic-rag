@@ -3,6 +3,10 @@
 Protocol: client sends {agent_id, kb_ids?, question}; server streams status events
 (retrieving / reranking / generating / validating) then a single final answer
 message after the groundedness gate passes. No token streaming / retraction.
+
+The final answer includes `sources`: the documents (filename + version) the cited
+chunk_ids came from, mapped deterministically from the retrieved set rather than
+trusting the model to name files.
 """
 from __future__ import annotations
 
@@ -21,6 +25,25 @@ _STATUS_BY_NODE = {
     "generate": "generating",
     "validate": "validating",
 }
+
+
+def _build_sources(
+    references: list[str], retrieved: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Group cited chunk_ids by their source document (filename, version)."""
+    by_id = {c.get("chunk_id"): c for c in retrieved}
+    grouped: dict[tuple[Any, Any], dict[str, Any]] = {}
+    for chunk_id in references:
+        chunk = by_id.get(chunk_id)
+        if chunk is None:
+            continue  # cited id not in retrieved set; nothing to attribute
+        key = (chunk.get("filename"), chunk.get("version"))
+        entry = grouped.setdefault(
+            key,
+            {"filename": chunk.get("filename"), "version": chunk.get("version"), "chunk_ids": []},
+        )
+        entry["chunk_ids"].append(chunk_id)
+    return list(grouped.values())
 
 
 async def chat_ws(ws: WebSocket) -> None:
@@ -75,10 +98,12 @@ async def chat_ws(ws: WebSocket) -> None:
         return
 
     rejected = bool(final.get("rejected", False))
+    sources = _build_sources(answer.references, final.get("retrieved", []) or [])
     result = {
         "type": "answer",
         "answer": answer.answer,
         "references": answer.references,
+        "sources": sources,
         "confidence": answer.confidence,
         "rejected": rejected,
     }
@@ -89,6 +114,7 @@ async def chat_ws(ws: WebSocket) -> None:
         content=answer.answer,
         metadata={
             "references": answer.references,
+            "sources": sources,
             "confidence": answer.confidence,
             "rejected": rejected,
         },

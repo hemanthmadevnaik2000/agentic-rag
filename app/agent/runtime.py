@@ -2,7 +2,8 @@
 
 Enforces the KB allowlist: requested kb_ids must be a subset of the agent
 configured kb_ids. All KBs in play must share one embedding space and destination
-(one Milvus collection), so a multi-KB query is a single filtered search.
+(one Milvus collection), so a multi-KB query is a single filtered search. The graph
+is compiled with the Postgres checkpointer so sessions get per-thread memory.
 """
 from __future__ import annotations
 
@@ -11,6 +12,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from app import crypto
+from app.agent.checkpointer import get_checkpointer
 from app.agent.graph import build_agent_graph
 from app.agent.llm.factory import build_structured_llm
 from app.config import get_settings
@@ -48,9 +50,7 @@ async def build_runtime(
     llm_row = await queries.get_llm(agent["llm_id"])
     if llm_row is None:
         raise RuntimeError_("Agent LLM registration not found.")
-    api_key = (
-        crypto.decrypt(llm_row["api_key_enc"]) if llm_row["api_key_enc"] else ""
-    )
+    api_key = crypto.decrypt(llm_row["api_key_enc"]) if llm_row["api_key_enc"] else ""
     llm = build_structured_llm(
         llm_row["provider"], llm_row["model"], api_key, llm_row["base_url"]
     )
@@ -86,11 +86,18 @@ async def build_runtime(
         milvus_token=token,
         enable_bm25=settings.enable_bm25,
     )
+
+    try:
+        checkpointer = get_checkpointer()
+    except RuntimeError:
+        checkpointer = None  # memory disabled if not initialized (e.g. in tests)
+
     graph = build_agent_graph(
         llm,
         target,
         confidence_threshold=agent["confidence_threshold"],
         max_retries=agent["max_retries"],
         system_prompt=agent["system_prompt"],
+        checkpointer=checkpointer,
     )
     return AgentRuntime(graph=graph, agent=agent, kb_ids=[str(k) for k in effective])

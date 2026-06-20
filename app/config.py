@@ -31,6 +31,8 @@ class Settings(BaseSettings):
     retrieval_top_k: int = 5
     retrieval_candidates: int = 20
     rrf_k: int = 60
+    # Sessions / memory (checkpointer cleanup horizon, seconds)
+    session_ttl_seconds: int = 86400
     # Tracing
     langsmith_tracing: bool = False
     langsmith_api_key: str = ""

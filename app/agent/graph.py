@@ -3,10 +3,15 @@
 validate enforces the groundedness gate (self-reported confidence + non-empty
 references). On failure it retries generation with feedback up to max_retries,
 then returns a safe fallback. Node names map to websocket status events.
+
+Per-session memory: the `history` channel accumulates prior turns and is persisted
+by the checkpointer, keyed by thread_id (the session/conversation id). On a resumed
+thread the prior history is restored automatically, so follow-up questions have context.
 """
 from __future__ import annotations
 
-from typing import Any, TypedDict
+import operator
+from typing import Annotated, Any, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
@@ -18,12 +23,15 @@ DEFAULT_SYSTEM = (
     "You are a retrieval-grounded assistant. Answer ONLY using the provided context "
     "chunks. If the context does not contain the answer, say so and set confidence low. "
     "Populate references with the chunk_id values you actually used. Never invent facts "
-    "or cite chunk_ids that are not in the context."
+    "or cite chunk_ids that are not in the context. Use the conversation so far only to "
+    "interpret follow-up questions; never use it as a source of facts."
 )
 
 FALLBACK_ANSWER = (
     "I could not find a confident, grounded answer in the attached knowledge bases."
 )
+
+_MAX_HISTORY_TURNS = 12  # cap how much prior dialogue is fed back into the prompt
 
 
 class AgentState(TypedDict, total=False):
@@ -35,15 +43,23 @@ class AgentState(TypedDict, total=False):
     feedback: str
     rejected: bool
     decision: str
+    history: Annotated[list[dict[str, Any]], operator.add]
 
 
 def _format_context(chunks: list[dict[str, Any]]) -> str:
-    blocks = []
-    for c in chunks:
-        blocks.append(
-            f"[chunk_id={c.get('chunk_id')} file={c.get('filename')}]\n{c.get('text', '')}"
-        )
+    blocks = [
+        f"[chunk_id={c.get('chunk_id')} file={c.get('filename')}]\n{c.get('text', '')}"
+        for c in chunks
+    ]
     return "\n\n".join(blocks) if blocks else "(no context retrieved)"
+
+
+def _format_history(history: list[dict[str, Any]]) -> str:
+    if not history:
+        return ""
+    recent = history[-_MAX_HISTORY_TURNS:]
+    lines = [f"{h.get('role', 'user').capitalize()}: {h.get('content', '')}" for h in recent]
+    return "Conversation so far:\n" + "\n".join(lines) + "\n\n"
 
 
 def build_agent_graph(
@@ -53,6 +69,7 @@ def build_agent_graph(
     confidence_threshold: float,
     max_retries: int,
     system_prompt: str | None,
+    checkpointer: Any = None,
 ):
     system = system_prompt or DEFAULT_SYSTEM
 
@@ -66,8 +83,10 @@ def build_agent_graph(
 
     async def generate_node(state: AgentState) -> AgentState:
         context = _format_context(state.get("retrieved", []))
+        history = _format_history(state.get("history", []))
         feedback = state.get("feedback", "")
         user = (
+            f"{history}"
             f"Question: {state['question']}\n\n"
             f"Context chunks:\n{context}\n\n"
             f"{feedback}\n"
@@ -104,7 +123,12 @@ def build_agent_graph(
         }
 
     async def respond_node(state: AgentState) -> AgentState:
-        return {}
+        answer = state.get("answer")
+        turn = [
+            {"role": "user", "content": state["question"]},
+            {"role": "assistant", "content": answer.answer if answer else ""},
+        ]
+        return {"history": turn}
 
     def route_after_validate(state: AgentState) -> str:
         return state.get("decision", "respond")
@@ -124,4 +148,4 @@ def build_agent_graph(
         "validate", route_after_validate, {"generate": "generate", "respond": "respond"}
     )
     graph.add_edge("respond", END)
-    return graph.compile()
+    return graph.compile(checkpointer=checkpointer)

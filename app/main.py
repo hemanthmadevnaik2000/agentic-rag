@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from app.agent.checkpointer import close_checkpointer, init_checkpointer
 from app.agent.router import router as agents_router
 from app.agent.ws import chat_ws
 from app.db.pool import close_pool, init_pool
@@ -19,9 +20,11 @@ async def lifespan(app: FastAPI):
     configure_tracing()
     await init_pool()
     await init_arq()
+    await init_checkpointer()
     try:
         yield
     finally:
+        await close_checkpointer()
         await close_arq()
         await close_pool()
 

@@ -1,6 +1,6 @@
 # Agentic RAG
 
-Build **knowledge bases** from your documents and chat with a **grounded, citation-aware agent** that answers strictly from those knowledge bases over a WebSocket.
+Build **knowledge bases** from your documents and chat with a **grounded, citation-aware agent** that answers strictly from those knowledge bases over a WebSocket — with **per-session memory**.
 
 ![Python](https://img.shields.io/badge/python-3.11+-blue)
 ![FastAPI](https://img.shields.io/badge/API-FastAPI-009688)
@@ -14,7 +14,7 @@ Build **knowledge bases** from your documents and chat with a **grounded, citati
 Agentic RAG is a production-shaped (but personal-scale) Retrieval-Augmented Generation system with two halves:
 
 - **Knowledge bases (KBs):** upload documents (PDF / DOCX / TXT / MD); they are semantically chunked, embedded, and pushed to a vector DB (Milvus), with optional keyword indexing in Elasticsearch.
-- **Agent:** attach one or more KBs and ask questions over a WebSocket. The agent retrieves with hybrid search, generates a **structured** answer, and runs it through a **groundedness gate** (confidence + references) before returning it.
+- **Agent:** attach one or more KBs and chat over a WebSocket. The agent retrieves with hybrid search, generates a **structured** answer, and runs it through a **groundedness gate** (confidence + references) before returning it — remembering the conversation within a session.
 
 It is a **modular monolith**: one FastAPI app with `kb` and `agent` modules, plus an async ingestion worker.
 
@@ -25,6 +25,8 @@ It is a **modular monolith**: one FastAPI app with `kb` and `agent` modules, plu
 - **Document ingestion** — PDF, DOCX, TXT, Markdown, with **semantic chunking**.
 - **Hybrid retrieval** — dense vectors (Milvus) + BM25 keyword search (Elasticsearch) fused with **Reciprocal Rank Fusion**, then **cross-encoder reranking**.
 - **Grounded answers** — the LLM is forced to return structured output `{answer, references, confidence}`; a validation gate rejects low-confidence / unreferenced answers and retries with feedback before falling back to a safe "I could not find it".
+- **Source attribution** — each answer reports the **documents** (filename + version) its cited chunks came from, mapped from the retrieved set.
+- **Session memory** — multi-turn conversations persisted with a **Postgres LangGraph checkpointer**; resume a session by `session_id`, with TTL-based cleanup.
 - **Multi-provider LLMs** — OpenAI, Anthropic, and self-hosted / custom SLMs behind one `StructuredLLM` interface; providers are registered at runtime via an API.
 - **Pluggable embeddings & reranker** — local (sentence-transformers / BGE) by default, swappable for cloud.
 - **Secrets encrypted at rest** — vector-DB credentials and LLM API keys are encrypted with Fernet; the API never returns them (only a masked `secret_last4`).
@@ -40,26 +42,27 @@ It is a **modular monolith**: one FastAPI app with `kb` and `agent` modules, plu
 ```
                  +---------------------------- FastAPI app ----------------------------+
    HTTP -------->|  /destinations  /llms  /kb  /agents                                 |
-   WebSocket --->|  /ws/chat                                                           |
+   WebSocket --->|  /ws/chat  (sessions, multi-turn)                                   |
                  |      |                 |                          |                 |
                  |      v                 v                          v                 |
                  |  Postgres        arq enqueue              Agent (LangGraph)         |
                  |  (plain SQL,     (ingest job)        retrieve->rerank->generate     |
-                 |   secrets enc.)        |                  ->validate->respond        |
+                 |   secrets enc.,        |                  ->validate->respond        |
+                 |   checkpointer)        |                          |                 |
                  +------------------------|--------------------------|-----------------+
-                                          v                          |
-                                   arq worker                        | hybrid_retrieve
-                          load -> chunk -> embed -> write            v
-                                          |                  +---------------+
-                                          +-----------------)| Milvus (dense)|
-                                                             | Elastic (BM25)|
-                                                             +---------------+
+                                          v                          | hybrid_retrieve
+                                   arq worker                        v
+                          load -> chunk -> embed -> write     +---------------+
+                          + hourly session TTL cleanup        | Milvus (dense)|
+                                          |                   | Elastic (BM25)|
+                                          +------------------>+---------------+
 ```
 
-**Request flow when chatting:** client opens `/ws/chat` with `{agent_id, kb_ids, question}` →
+**Request flow when chatting:** client opens `/ws/chat` with `{agent_id, kb_ids, question, session_id?}` →
 the agent runs `retrieve` (dense + BM25 → RRF) → `rerank` (cross-encoder) → `generate`
 (structured output from the registered LLM) → `validate` (confidence + references gate,
-retry on failure) → `respond`. Each node maps to a status event on the socket.
+retry on failure) → `respond`. Each node maps to a status event; prior turns are restored
+from the checkpointer keyed by the session id.
 
 ---
 
@@ -68,7 +71,7 @@ retry on failure) → `respond`. Each node maps to a status event on the socket.
 | Concern | Choice |
 |---|---|
 | API / WebSocket | FastAPI + uvicorn |
-| Agent orchestration | LangGraph |
+| Agent orchestration | LangGraph (+ Postgres checkpointer for memory) |
 | LLMs | OpenAI / Anthropic / custom SLM (via LangChain chat models) |
 | Vector DB | Milvus (one collection per embedding space, `kb_id` partition) |
 | Keyword search | Elasticsearch BM25 (optional, `ENABLE_BM25`) |
@@ -104,10 +107,10 @@ cp .env.example .env
 # generate an encryption key and paste it into APP_ENCRYPTION_KEYS in .env:
 python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 
-# 4. Apply the database schema
+# 4. Apply the database schema (also creates checkpointer tables on first run)
 python -m app.db.migrate
 
-# 5. Run the API and the ingestion worker (two shells)
+# 5. Run the API and the ingestion/cleanup worker (two shells)
 uvicorn app.main:app --reload
 arq app.worker.WorkerSettings
 ```
@@ -123,7 +126,7 @@ All settings come from environment variables (see `.env.example`).
 
 | Variable | Default | Description |
 |---|---|---|
-| `DATABASE_URL` | `postgresql://rag:rag@localhost:5432/rag` | Postgres DSN |
+| `DATABASE_URL` | `postgresql://rag:rag@localhost:5432/rag` | Postgres DSN (app + checkpointer) |
 | `REDIS_URL` | `redis://localhost:6379/0` | Redis for arq |
 | `MILVUS_URI` | `http://localhost:19530` | Milvus endpoint |
 | `MILVUS_TOKEN` | _(empty)_ | Milvus auth token (also stored per-destination, encrypted) |
@@ -137,6 +140,7 @@ All settings come from environment variables (see `.env.example`).
 | `RETRIEVAL_TOP_K` | `5` | Chunks returned after rerank |
 | `RETRIEVAL_CANDIDATES` | `20` | Candidates fetched per retriever before fusion |
 | `RRF_K` | `60` | RRF constant |
+| `SESSION_TTL_SECONDS` | `86400` | Idle sessions purged after this many seconds (Postgres has no native TTL) |
 | `LANGSMITH_TRACING` | `false` | Enable LangSmith tracing |
 | `LANGSMITH_API_KEY` | _(empty)_ | LangSmith key |
 | `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` | _(empty)_ | Dev fallback only; registered LLMs live in the DB |
@@ -195,39 +199,62 @@ curl -X POST http://localhost:8000/agents -H "Content-Type: application/json" -d
 }'
 ```
 
-### 5. Chat over WebSocket
+### 5. Chat over WebSocket (sessions + memory)
 
-Connect to `ws://localhost:8000/ws/chat` and send:
+Connect to `ws://localhost:8000/ws/chat` and send a first message:
 
 ```json
-{ "agent_id": "<agent-uuid>", "kb_ids": ["<kb-uuid>"], "question": "What is the refund policy?" }
+{ "agent_id": "<agent-uuid>", "kb_ids": ["<kb-uuid>"], "question": "What is the refund policy?", "session_id": "<optional, to resume>" }
 ```
 
-`kb_ids` is optional and, if provided, must be a subset of the configured KBs for that agent (allowlist). You receive status events then one answer:
+`kb_ids` and `session_id` are optional. Omit `session_id` to start a new session; pass it to
+resume one (memory restored). `kb_ids`, if given, must be a subset of the agent configured
+KBs (allowlist). The server first returns the session id:
 
 ```json
-{ "type": "status",  "stage": "retrieving" }
-{ "type": "status",  "stage": "reranking" }
-{ "type": "status",  "stage": "generating" }
-{ "type": "status",  "stage": "validating" }
-{ "type": "answer",  "answer": "...",
+{ "type": "session", "session_id": "<uuid>" }
+```
+
+Then, per question, you receive status events and a final answer:
+
+```json
+{ "type": "status", "stage": "retrieving" }
+{ "type": "status", "stage": "reranking" }
+{ "type": "status", "stage": "generating" }
+{ "type": "status", "stage": "validating" }
+{ "type": "answer", "answer": "...",
   "references": ["<chunk_id>"],
   "sources": [{ "filename": "handbook.pdf", "version": 1, "chunk_ids": ["<chunk_id>"] }],
   "confidence": 0.82, "rejected": false }
 ```
 
-Minimal Python client:
+**Keep the socket open and send more `{ "question": "..." }` messages to continue the same
+session** — the agent remembers prior turns. Reconnecting later with the same `session_id`
+restores the memory.
+
+Minimal multi-turn Python client:
 
 ```python
 import asyncio, json, websockets
 
 async def main():
     async with websockets.connect("ws://localhost:8000/ws/chat") as ws:
+        # first turn (no session_id -> new session)
         await ws.send(json.dumps({
             "agent_id": "<agent-uuid>",
             "kb_ids": ["<kb-uuid>"],
             "question": "What is the refund policy?",
         }))
+        session_id = None
+        async for raw in ws:
+            msg = json.loads(raw)
+            print(msg)
+            if msg["type"] == "session":
+                session_id = msg["session_id"]
+            if msg["type"] == "answer":
+                break
+        # follow-up turn on the same session
+        await ws.send(json.dumps({"question": "And for digital goods?"}))
         async for raw in ws:
             print(json.loads(raw))
 
@@ -253,15 +280,23 @@ candidates; they are fused with **Reciprocal Rank Fusion** and then reordered by
 `retrieve -> rerank -> generate -> validate -> respond`. `generate` enforces structured output
 `{answer, references, confidence}`. `validate` rejects answers below `confidence_threshold`
 or with no references, loops back to `generate` with corrective feedback up to `max_retries`,
-then returns a safe fallback. `references` are emitted as `chunk_id`s so a future upgrade to
-hard chunk-id validation is a small change. The WebSocket response also includes `sources` —
-the documents (filename + version) those cited chunks came from, mapped deterministically from
-the retrieved set.
+then returns a safe fallback. `references` are emitted as `chunk_id`s, and the response also
+includes `sources` — the documents (filename + version) those cited chunks came from, mapped
+deterministically from the retrieved set.
+
+### Sessions & memory
+Each session maps to a checkpoint `thread_id` (the conversation id). The graph is compiled
+with a Postgres `AsyncPostgresSaver`, so the accumulating `history` channel is persisted per
+thread; resuming a session restores prior turns and follow-up questions get context.
+**Postgres has no native TTL**, so `delete_expired_sessions()` runs hourly from the arq worker
+and removes checkpoints + conversations idle longer than `SESSION_TTL_SECONDS` (tracked via
+`last_active_at`).
 
 ### Security
 Vector-DB credentials and LLM keys are encrypted with Fernet before they touch Postgres and
 decrypted only at point of use; the encryption key lives in `APP_ENCRYPTION_KEYS`, never in the
-DB. `query_knowledge_base` binds `kb_ids` server-side, so the model can never widen KB access.
+DB. `query_knowledge_base` binds `kb_ids` server-side, so the model can never widen KB access;
+resuming a session also verifies it belongs to the same agent.
 
 ---
 
@@ -273,7 +308,7 @@ app/
   config.py               settings (pydantic-settings)
   crypto.py               Fernet encrypt/decrypt + Secret wrapper
   queue.py                arq pool
-  worker.py               arq worker (ingestion job)
+  worker.py               arq worker (ingestion job + session TTL cron)
   tracing.py              LangSmith wrapper
   db/                     asyncpg pool, plain-SQL queries, migration runner
   destinations/           Milvus connection CRUD
@@ -285,12 +320,13 @@ app/
     search/               bm25, rrf, rerank, retriever
     router.py service.py schemas.py
   agent/
-    graph.py              LangGraph definition
+    graph.py              LangGraph definition (+ history channel)
     runtime.py            build a runnable agent from config
+    checkpointer.py       Postgres session memory + TTL cleanup
     tools.py              query_knowledge_base (kb_ids bound server-side)
     llm/                  StructuredLLM port + provider adapters
     management.py router.py ws.py schemas.py
-migrations/               0001_init.sql
+migrations/               0001_init.sql, 0002_session_memory.sql
 tests/                    crypto + rrf unit tests
 docker-compose.yml
 ```
@@ -313,6 +349,7 @@ Full end-to-end verification (ingest -> retrieve -> answer) requires the Docker 
 - **Embedding dimension** is taken from `EMBEDDING_DIM` and stored on each KB; it must match the embedding model.
 - **Multi-KB chat** requires the attached KBs to share one embedding space *and* one destination — that is what makes a multi-KB query a single filtered search.
 - **Document versioning** keeps only the latest version searchable in the vector store; full version history lives in Postgres.
+- **Session memory** uses a Postgres checkpointer keyed by session id; since Postgres lacks TTL, an hourly worker job prunes sessions idle beyond `SESSION_TTL_SECONDS`.
 
 ---
 

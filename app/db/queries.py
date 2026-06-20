@@ -198,3 +198,30 @@ async def list_messages(conversation_id: uuid.UUID) -> list[dict[str, Any]]:
         "SELECT * FROM messages WHERE conversation_id = $1 ORDER BY created_at ASC",
         conversation_id,
     )
+
+
+# --------------------------------------------------------------------------- #
+# sessions (conversations used as checkpoint threads)
+# --------------------------------------------------------------------------- #
+async def get_conversation(conversation_id: uuid.UUID) -> dict[str, Any] | None:
+    return await _fetchrow("SELECT * FROM conversations WHERE id = $1", conversation_id)
+
+
+async def touch_conversation(conversation_id: uuid.UUID) -> None:
+    await get_pool().execute(
+        "UPDATE conversations SET last_active_at = now() WHERE id = $1", conversation_id
+    )
+
+
+async def delete_conversation(conversation_id: uuid.UUID) -> bool:
+    return await _execute_deleted(
+        "DELETE FROM conversations WHERE id = $1", conversation_id
+    )
+
+
+async def expired_conversation_ids(ttl_seconds: int) -> list[uuid.UUID]:
+    rows = await _fetch(
+        "SELECT id FROM conversations WHERE last_active_at < now() - make_interval(secs => $1)",
+        ttl_seconds,
+    )
+    return [r["id"] for r in rows]

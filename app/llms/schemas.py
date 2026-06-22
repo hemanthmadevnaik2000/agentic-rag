@@ -16,6 +16,9 @@ class LLMCreate(BaseModel):
     base_url: str | None = None  # required for custom / self-hosted
     # Write-only: never echoed back.
     api_key: str | None = Field(default=None, repr=False)
+    # Whether this model supports tool calling -> selects the agent engine.
+    # None = default by provider (openai/anthropic True, custom False).
+    supports_tools: bool | None = None
 
 
 class LLMOut(BaseModel):
@@ -24,5 +27,6 @@ class LLMOut(BaseModel):
     provider: str
     model: str
     base_url: str | None
+    supports_tools: bool
     secret_last4: str | None
     created_at: datetime

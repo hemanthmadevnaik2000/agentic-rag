@@ -25,6 +25,7 @@ It is a **modular monolith**: one FastAPI app with `kb` and `agent` modules, plu
 - **Document ingestion** — PDF, DOCX, TXT, Markdown, with **semantic chunking**.
 - **Hybrid retrieval** — dense vectors (Milvus) + BM25 keyword search (Elasticsearch) fused with **Reciprocal Rank Fusion**, then **cross-encoder reranking**.
 - **Grounded answers** — the LLM is forced to return structured output `{answer, references, confidence}`; a validation gate rejects low-confidence / unreferenced answers and retries with feedback before falling back to a safe "I could not find it".
+- **Agentic tool-calling** — for tool-capable models the agent decides *when*, *what*, and *how many times* to search (parallel `query_knowledge_base` calls), then exits via a `submit_answer` tool; SLMs without tool support use a fixed pipeline. Swappable via an `AgentEngine` factory.
 - **Source attribution** — each answer reports the **documents** (filename + version) its cited chunks came from, mapped from the retrieved set.
 - **Session memory** — multi-turn conversations persisted with a **Postgres LangGraph checkpointer**; resume a session by `session_id`, with TTL-based cleanup.
 - **Semantic cache** — a semantically similar prior query (scoped per KB set) returns a cached answer, skipping retrieval + generation; native Redis TTL via **Redis Stack / RedisVL**.
@@ -176,7 +177,7 @@ curl -X POST http://localhost:8000/llms -H "Content-Type: application/json" -d '
 }'
 ```
 
-`provider` is `openai`, `anthropic`, or `custom` (custom requires `base_url`). Responses never include the key — only `secret_last4`.
+`provider` is `openai`, `anthropic`, or `custom` (custom requires `base_url`). Responses never include the key — only `secret_last4`. Optional `supports_tools` selects the agent engine: defaults to `true` for openai/anthropic (tool-calling loop) and `false` for custom (fixed pipeline); set it explicitly for a tool-capable self-hosted model.
 
 ### 3. Create a knowledge base (multipart upload)
 
@@ -284,13 +285,20 @@ Dense search (Milvus, cosine over normalized embeddings) and BM25 (Elasticsearch
 candidates; they are fused with **Reciprocal Rank Fusion** and then reordered by a
 **cross-encoder reranker**. With `ENABLE_BM25=false` it degrades cleanly to dense-only.
 
-### Agent (LangGraph)
-`retrieve -> rerank -> generate -> validate -> respond`. `generate` enforces structured output
-`{answer, references, confidence}`. `validate` rejects answers below `confidence_threshold`
-or with no references, loops back to `generate` with corrective feedback up to `max_retries`,
-then returns a safe fallback. `references` are emitted as `chunk_id`s, and the response also
-includes `sources` — the documents (filename + version) those cited chunks came from, mapped
-deterministically from the retrieved set.
+### Agent (two engines, LangGraph)
+The engine is chosen per the registered LLM's `supports_tools` flag, behind an `AgentEngine`
+interface + factory (so more strategies are easy to add):
+
+- **Tool-calling engine** (tool-capable models) — a model-driven loop: `agent_node` (the LLM bound
+  with `query_knowledge_base` + `submit_answer`) decides *whether* to search, *what* to search, and
+  *how many times* (parallel calls supported); `tool_node` runs the searches and feeds results back;
+  the loop ends when the model calls `submit_answer`, whose args are the structured answer.
+- **Pipeline engine** (SLMs without tool calling) — the fixed `retrieve -> rerank -> generate ->
+  validate` flow using the prompt-based `StructuredLLM`.
+
+Both enforce the same groundedness gate (confidence ≥ `confidence_threshold` and non-empty
+`references`, else a safe fallback), share the rewrite / cache / memory front and tail, and emit
+`sources` (filename + version) for the cited chunks.
 
 ### Semantic caching
 Before retrieval, `rewrite` turns the question (+ recent history) into a standalone, canonical
@@ -336,15 +344,15 @@ app/
     search/               bm25, rrf, rerank, retriever
     router.py service.py schemas.py
   agent/
-    graph.py              LangGraph definition (+ history channel)
-    runtime.py            build a runnable agent from config
+    engines/              AgentEngine interface + factory; tool_calling & pipeline engines; shared nodes
+    runtime.py            build a runnable agent (selects engine) from config
     checkpointer.py       Postgres session memory + TTL cleanup
     cache.py              semantic cache (RedisVL) + KB-scope invalidation
     rewrite.py            history-aware standalone-query rewriting
-    tools.py              query_knowledge_base (kb_ids bound server-side)
-    llm/                  StructuredLLM port + provider adapters
+    tools.py              QueryKnowledgeBase + SubmitAnswer (kb_name allowlisted server-side)
+    llm/                  StructuredLLM port, chat-model builder, provider adapters
     management.py router.py ws.py schemas.py
-migrations/               0001_init.sql, 0002_session_memory.sql
+migrations/               0001_init.sql, 0002_session_memory.sql, 0003_llm_tools.sql
 tests/                    crypto + rrf unit tests
 docker-compose.yml
 ```

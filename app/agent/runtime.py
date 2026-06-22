@@ -1,9 +1,9 @@
 """Assemble a runnable agent graph from a registered agent + requested KBs.
 
-Enforces the KB allowlist: requested kb_ids must be a subset of the agent
-configured kb_ids. All KBs in play must share one embedding space and destination
-(one Milvus collection). The graph is compiled with the Postgres checkpointer
-(session memory) and a per-KB-set cache scope (semantic cache).
+Resolves the LLM, KBs, destination, cache scope, and a name->kb_id map (the tool
+allowlist), then hands an EngineContext to the engine selected for this LLM
+(tool-calling vs pipeline). KB allowlist: requested kb_ids must be a subset of the
+agent configured kb_ids, and all KBs must share one embedding space + destination.
 """
 from __future__ import annotations
 
@@ -14,8 +14,8 @@ from typing import Any
 from app import crypto
 from app.agent import cache as cache_mod
 from app.agent.checkpointer import get_checkpointer
-from app.agent.graph import build_agent_graph
-from app.agent.llm.factory import build_structured_llm
+from app.agent.engines.base import EngineContext
+from app.agent.engines.factory import select_engine
 from app.config import get_settings
 from app.db import queries
 from app.kb.search.retriever import RetrievalTarget
@@ -52,9 +52,6 @@ async def build_runtime(
     if llm_row is None:
         raise RuntimeError_("Agent LLM registration not found.")
     api_key = crypto.decrypt(llm_row["api_key_enc"]) if llm_row["api_key_enc"] else ""
-    llm = build_structured_llm(
-        llm_row["provider"], llm_row["model"], api_key, llm_row["base_url"]
-    )
 
     kbs = await queries.get_kbs_by_ids(list(effective))
     if not kbs:
@@ -81,6 +78,8 @@ async def build_runtime(
     ) or settings.embedding_provider
 
     kb_id_strings = [str(k) for k in effective]
+    name_to_kb_id = {k["name"]: str(k["id"]) for k in kbs}
+
     target = RetrievalTarget(
         kb_ids=tuple(kb_id_strings),
         embedding_provider=provider,
@@ -94,18 +93,18 @@ async def build_runtime(
     try:
         checkpointer = get_checkpointer()
     except RuntimeError:
-        checkpointer = None  # memory disabled if not initialized (e.g. in tests)
+        checkpointer = None
 
-    scope = cache_mod.make_scope(kb_id_strings)
-
-    graph = build_agent_graph(
-        llm,
-        target,
-        confidence_threshold=agent["confidence_threshold"],
-        max_retries=agent["max_retries"],
-        system_prompt=agent["system_prompt"],
+    ctx = EngineContext(
+        llm_row=llm_row,
+        api_key=api_key,
+        agent=agent,
+        target=target,
+        name_to_kb_id=name_to_kb_id,
         checkpointer=checkpointer,
-        cache_scope=scope,
+        cache_scope=cache_mod.make_scope(kb_id_strings),
         cache_kb_ids=kb_id_strings,
     )
+    engine = select_engine(llm_row)
+    graph = engine.build_graph(ctx)
     return AgentRuntime(graph=graph, agent=agent, kb_ids=kb_id_strings)

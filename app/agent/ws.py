@@ -1,15 +1,14 @@
-"""Websocket chat endpoint with per-session memory and semantic caching.
+"""Websocket chat endpoint: session memory + semantic cache + agentic engines.
 
 Protocol:
-  - Client connects and sends a first message: {agent_id, kb_ids?, question?, session_id?}.
-      * session_id present -> resume that session (memory restored from the checkpointer).
-      * session_id absent  -> a new session is created.
-  - Server replies with {"type":"session","session_id": "..."} so the client can reuse it.
-  - Per question, the server streams status events
-    (rewriting / checking_cache / retrieving / reranking / generating / validating)
-    then one final answer. A semantic-cache hit jumps straight to the answer with
-    "cached": true.
-  - The socket stays open: send more {question} messages to continue the same session.
+  - First message: {agent_id, kb_ids?, question?, session_id?}.
+      session_id present -> resume session (memory restored); absent -> new session.
+  - Server replies {"type":"session","session_id":"..."}.
+  - Per question: status events then one final answer (with "cached": bool).
+  - Socket stays open for follow-up {question} messages.
+
+The engine (tool-calling vs pipeline) is chosen per the agent LLM; this layer is
+engine-agnostic and just maps node names to status stages.
 """
 from __future__ import annotations
 
@@ -29,6 +28,9 @@ _STATUS_BY_NODE = {
     "rerank": "reranking",
     "generate": "generating",
     "validate": "validating",
+    "agent": "thinking",
+    "tools": "searching_kb",
+    "finalize": "finalizing",
 }
 
 
@@ -54,7 +56,7 @@ async def _run_turn(
                     await ws.send_json({"type": "status", "stage": stage})
                 if isinstance(update, dict):
                     final.update(update)
-    except Exception as exc:  # noqa: BLE001 - surface failure to the client
+    except Exception as exc:  # noqa: BLE001
         await ws.send_json({"type": "error", "message": f"agent error: {exc}"})
         return
 

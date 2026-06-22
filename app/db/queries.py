@@ -55,16 +55,16 @@ async def delete_destination(dest_id: uuid.UUID) -> bool:
 # llm_registrations
 # --------------------------------------------------------------------------- #
 async def create_llm(
-    *, name, provider, base_url, model, api_key_enc, key_version, secret_last4
+    *, name, provider, base_url, model, api_key_enc, key_version, secret_last4, supports_tools
 ) -> dict[str, Any]:
     return await _fetchrow(  # type: ignore[return-value]
         """
         INSERT INTO llm_registrations
-            (name, provider, base_url, model, api_key_enc, key_version, secret_last4)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
+            (name, provider, base_url, model, api_key_enc, key_version, secret_last4, supports_tools)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
         RETURNING *
         """,
-        name, provider, base_url, model, api_key_enc, key_version, secret_last4,
+        name, provider, base_url, model, api_key_enc, key_version, secret_last4, supports_tools,
     )
 
 

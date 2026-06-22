@@ -17,6 +17,7 @@ def _to_out(row: dict[str, Any]) -> LLMOut:
         provider=row["provider"],
         model=row["model"],
         base_url=row["base_url"],
+        supports_tools=row["supports_tools"],
         secret_last4=row["secret_last4"],
         created_at=row["created_at"],
     )
@@ -37,6 +38,11 @@ async def create_llm(payload: LLMCreate) -> LLMOut:
     _validate(payload)
     api_key_enc = crypto.encrypt(payload.api_key) if payload.api_key else None
     last4 = crypto.last4(payload.api_key) if payload.api_key else None
+    supports_tools = (
+        payload.supports_tools
+        if payload.supports_tools is not None
+        else payload.provider in ("openai", "anthropic")
+    )
 
     row = await queries.create_llm(
         name=payload.name,
@@ -46,6 +52,7 @@ async def create_llm(payload: LLMCreate) -> LLMOut:
         api_key_enc=api_key_enc,
         key_version=crypto.KEY_VERSION,
         secret_last4=last4,
+        supports_tools=supports_tools,
     )
     return _to_out(row)
 
